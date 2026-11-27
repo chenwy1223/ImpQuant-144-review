@@ -1,8 +1,8 @@
 import base64
+import os
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
-import decord
 import torch
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
@@ -42,22 +42,32 @@ class Qwen2_5_VL(lmms):
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
         use_flash_attention_2: Optional[bool] = False,
+        attn_implementation: Optional[str] = None,
+        min_pixels: int = 256 * 28 * 28,
+        max_pixels: int = 1605632,
         **kwargs,
     ) -> None:
         super().__init__()
         # Do not use kwargs for now
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
 
-        accelerator = Accelerator()
-        if accelerator.num_processes > 1:
+        # On older Linux kernels, constructing Accelerator before loading a
+        # sharded checkpoint can deadlock in a single-process run.  Avoid the
+        # distributed bootstrap when WORLD_SIZE is one; this leaves the normal
+        # multi-process path unchanged.
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        accelerator = Accelerator() if world_size > 1 else None
+        num_processes = accelerator.num_processes if accelerator is not None else 1
+        local_process_index = accelerator.local_process_index if accelerator is not None else 0
+        if num_processes > 1:
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
             self.device_map = f"cuda:{accelerator.local_process_index}"
-        elif accelerator.num_processes == 1 and device_map == "auto":
+        elif device_map == "auto":
             self._device = torch.device(device)
             self.device_map = device_map
         else:
-            self._device = torch.device(f"cuda:{accelerator.local_process_index}")
-            self.device_map = f"cuda:{accelerator.local_process_index}"
+            self._device = torch.device(f"cuda:{local_process_index}")
+            self.device_map = f"cuda:{local_process_index}"
 
         if use_flash_attention_2:
             self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -67,19 +77,23 @@ class Qwen2_5_VL(lmms):
                 attn_implementation="flash_attention_2",
             ).eval()
         else:
-            self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                pretrained,
-                torch_dtype="auto",
-                device_map=self.device_map,
-            ).eval()
-        self.processor = AutoProcessor.from_pretrained(pretrained)
+            load_kwargs = {
+                "torch_dtype": "auto",
+                "device_map": self.device_map,
+            }
+            if attn_implementation is not None:
+                load_kwargs["attn_implementation"] = attn_implementation
+            self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained, **load_kwargs).eval()
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.processor = AutoProcessor.from_pretrained(pretrained, min_pixels=min_pixels, max_pixels=max_pixels)
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained)
 
         self._config = self.model.config
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
 
-        if accelerator.num_processes > 1:
+        if accelerator is not None and accelerator.num_processes > 1:
             assert accelerator.distributed_type in [
                 DistributedType.FSDP,
                 DistributedType.MULTI_GPU,
@@ -95,7 +109,7 @@ class Qwen2_5_VL(lmms):
             self._world_size = self.accelerator.num_processes
         else:
             self._rank = 0
-            self._word_size = 1
+            self._world_size = 1
 
     @property
     def config(self):
@@ -193,6 +207,10 @@ class Qwen2_5_VL(lmms):
                 if len(visuals) > 0:
                     visual = visuals[i] if i < len(visuals) else None
                     if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):  # Video file
+                        # Import lazily so image-only evaluation does not load
+                        # decord's bundled CUDA runtime before PyTorch.
+                        import decord
+
                         vr = decord.VideoReader(visual)
                         first_frame = vr[0].asnumpy()
                         height, width = first_frame.shape[:2]
@@ -204,7 +222,20 @@ class Qwen2_5_VL(lmms):
                         base64_image.save(buffer, format="JPEG")
                         base64_bytes = base64.b64encode(buffer.getvalue())
                         base64_string = base64_bytes.decode("utf-8")
-                        message.append({"role": "user", "content": [{"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"}, {"type": "text", "text": context}]})
+                        message.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "image": f"data:image/jpeg;base64,{base64_string}",
+                                        "min_pixels": self.min_pixels,
+                                        "max_pixels": self.max_pixels,
+                                    },
+                                    {"type": "text", "text": context},
+                                ],
+                            }
+                        )
                     elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  # Multiple images
                         image_content = []
                         for v in visual:
@@ -213,7 +244,14 @@ class Qwen2_5_VL(lmms):
                             base64_image.save(buffer, format="JPEG")
                             base64_bytes = base64.b64encode(buffer.getvalue())
                             base64_string = base64_bytes.decode("utf-8")
-                            image_content.append({"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"})
+                            image_content.append(
+                                {
+                                    "type": "image",
+                                    "image": f"data:image/jpeg;base64,{base64_string}",
+                                    "min_pixels": self.min_pixels,
+                                    "max_pixels": self.max_pixels,
+                                }
+                            )
                         message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
                     else:
                         message.append({"role": "user", "content": [{"type": "text", "text": context}]})
@@ -243,6 +281,18 @@ class Qwen2_5_VL(lmms):
                 gen_kwargs["num_beams"] = 1
 
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            image_grid_thw = inputs.get("image_grid_thw")
+            grid_summary = image_grid_thw.detach().cpu().tolist() if image_grid_thw is not None else None
+            visual_sizes = [visual.size if isinstance(visual, Image.Image) else type(visual).__name__ for visual in visuals]
+            eval_logger.info(
+                "QWEN_EVAL_INPUT task={} split={} doc_ids={} visual_count={} visual_sizes={} image_grid_thw={}",
+                task,
+                split,
+                list(doc_id),
+                len(visuals),
+                visual_sizes,
+                grid_summary,
+            )
             cont = self.model.generate(
                 **inputs,
                 eos_token_id=self.tokenizer.eos_token_id,

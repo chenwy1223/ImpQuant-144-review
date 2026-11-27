@@ -271,24 +271,38 @@ def run_mbq(
         model.to_cuda()
         print("Save gradient...")
         # save gradient
-        grad_cache = GradCacheHook(vis_masks=vision_mask, cap_masks=caption_mask)        
+        grad_cache = GradCacheHook(vis_masks=vision_mask, cap_masks=caption_mask)
         grad_cache.register_hooks(layers=layers)
-        
-        with torch.enable_grad():
-            mini_batch = 1
-            total_samples = next(iter(prompt_inputs.values())).shape[0]
-            accum_steps = int(total_samples/mini_batch)
-            
-            for i in tqdm.tqdm(range(0, total_samples, mini_batch), desc="Running gradient calculation..."):
-                # Qwen mRoPE position_ids has shape (3, batch, sequence).
-                mini_inputs = slice_batch(inputs, i, i + mini_batch, total_samples)
-                
-                outputs = model(**mini_inputs)
 
-                loss = outputs[0]
+        # MBQ only consumes gradients of intermediate activations. Computing
+        # parameter gradients wastes roughly one model copy of VRAM and makes a
+        # 7B model overflow a 24 GiB card. Freeze parameters temporarily and
+        # make the prepared multimodal embeddings the gradient root instead.
+        parameters = list(model.model.parameters())
+        requires_grad = [parameter.requires_grad for parameter in parameters]
+        previous_low_memory_loss = getattr(model, "low_memory_loss", False)
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+        model.low_memory_loss = True
+        try:
+            with torch.enable_grad():
+                mini_batch = 1
+                total_samples = next(iter(prompt_inputs.values())).shape[0]
+                accum_steps = int(total_samples/mini_batch)
 
-                loss = loss / accum_steps
-                loss.backward()
+                for i in tqdm.tqdm(range(0, total_samples, mini_batch), desc="Running gradient calculation..."):
+                    # Qwen mRoPE position_ids has shape (3, batch, sequence).
+                    mini_inputs = slice_batch(inputs, i, i + mini_batch, total_samples)
+                    if isinstance(mini_inputs.get("inputs_embeds"), torch.Tensor):
+                        mini_inputs["inputs_embeds"] = mini_inputs["inputs_embeds"].detach().requires_grad_(True)
+
+                    outputs = model(**mini_inputs)
+                    loss = outputs[0] / accum_steps
+                    loss.backward()
+        finally:
+            model.low_memory_loss = previous_low_memory_loss
+            for parameter, flag in zip(parameters, requires_grad):
+                parameter.requires_grad_(flag)
 
         model.to_cpu()
         grad_avg_dict = grad_cache.get_avg_grad_dict()

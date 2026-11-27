@@ -51,6 +51,17 @@ def qwrapper(model, prompt_inputs, prompt_kwargs, args):
             alpha=args.impquant_alpha,
             jsd_eps=args.impquant_jsd_eps,
             outlier_ratio=args.impquant_outlier_ratio,
+            percdamp=args.gptq_percdamp,
+            probe_cache_path=args.impquant_probe_cache_path,
+            probe_source_path=args.impquant_probe_source_path,
+            probe_only=args.impquant_probe_only,
+            skip_probe1=args.impquant_skip_probe1,
+            probe2_mode=args.impquant_probe2_mode,
+            probe_group_h=args.impquant_probe_group_h,
+            probe_group_w=args.impquant_probe_group_w,
+            probe_refine_ratio=args.impquant_probe_refine_ratio,
+            probe_refine_strategy=args.impquant_probe_refine_strategy,
+            probe_refine_seed=args.impquant_probe_refine_seed,
         )
     elif args.method == "gptq":
         model = gptq_entry(

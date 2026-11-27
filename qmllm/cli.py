@@ -24,15 +24,36 @@ def parse_args(calibration=False):
     parser.add_argument('--impquant_alpha', type=float, default=0.1)
     parser.add_argument('--impquant_jsd_eps', type=float, default=1e-2)
     parser.add_argument('--impquant_outlier_ratio', type=float, default=0.01)
+    parser.add_argument('--impquant_probe_cache_path')
+    parser.add_argument('--impquant_probe_source_path',
+                        help='Reuse previously cached exact probe components during calibration')
+    parser.add_argument('--impquant_probe_only', action='store_true')
+    parser.add_argument('--impquant_skip_probe1', action='store_true',
+                        help='Ablation: skip the visual repetition probe and use confidence=1')
+    parser.add_argument('--impquant_probe2_mode', choices=('exact', 'grouped', 'selective'),
+                        default='exact',
+                        help='Probe-2 estimator: exact per patch, grouped only, or grouped with selective exact refinement')
+    parser.add_argument('--impquant_probe_group_h', type=int, default=2)
+    parser.add_argument('--impquant_probe_group_w', type=int, default=2)
+    parser.add_argument('--impquant_probe_refine_ratio', type=float, default=0.25)
+    parser.add_argument('--impquant_probe_refine_strategy', choices=('top_jsd', 'random'),
+                        default='top_jsd')
+    parser.add_argument('--impquant_probe_refine_seed', type=int, default=2026)
     parser.add_argument('--seed', type=int, default=42)
     if calibration:
         parser.add_argument('--data_path', required=True)
         parser.add_argument('--image_folder', required=True)
         parser.add_argument('--n_samples', type=int, default=128)
+        parser.add_argument('--calib_vision_micro_batch_size', type=int, default=0,
+                            help='Split vision-tower calibration forwards by image; 0 keeps the original full batch')
+        parser.add_argument('--calib_input_micro_batch_size', type=int, default=0,
+                            help='Build multimodal calibration embeddings in sample chunks; 0 keeps one packed batch')
     else:
         parser.add_argument('--tasks', default='pope')
         parser.add_argument('--limit', type=int)
         parser.add_argument('--output_path', default='results.json')
+        parser.add_argument('--save_samples', action='store_true',
+                            help='Save lmms-eval per-sample records next to the aggregate JSON')
     args = parser.parse_args()
     if not (2 <= args.w_bit <= 16 and 2 <= args.a_bit <= 16):
         parser.error('Bit widths must be between 2 and 16')
@@ -40,8 +61,25 @@ def parse_args(calibration=False):
         parser.error('w_group must be -1 or positive')
     if args.method in ('awq', 'gptq') and args.a_bit != 16:
         parser.error('AWQ and GPTQ use a_bit=16')
-    if args.method != 'rtn' and not args.scale_path:
+    scale_optional = calibration and args.method == 'impquant' and args.impquant_probe_only
+    if args.method != 'rtn' and not args.scale_path and not scale_optional:
         parser.error('This method requires --scale_path')
+    if args.impquant_probe_only and (not calibration or args.method != 'impquant'):
+        parser.error('impquant_probe_only is valid only for ImpQuant calibration')
+    if args.impquant_probe_only and not args.impquant_probe_cache_path:
+        parser.error('impquant_probe_only requires --impquant_probe_cache_path')
+    if args.impquant_probe_source_path and (not calibration or args.method != 'impquant'):
+        parser.error('impquant_probe_source_path is valid only for ImpQuant calibration')
+    if args.impquant_skip_probe1 and args.method != 'impquant':
+        parser.error('impquant_skip_probe1 is valid only for ImpQuant')
+    if args.impquant_probe2_mode != 'exact' and args.method != 'impquant':
+        parser.error('impquant_probe2_mode is valid only for ImpQuant')
+    if args.impquant_probe2_mode != 'exact' and not args.impquant_skip_probe1:
+        parser.error('Grouped Probe 2 experiments require --impquant_skip_probe1')
+    if min(args.impquant_probe_group_h, args.impquant_probe_group_w) <= 0:
+        parser.error('ImpQuant probe group dimensions must be positive')
+    if not 0 <= args.impquant_probe_refine_ratio <= 1:
+        parser.error('impquant_probe_refine_ratio must be in [0, 1]')
     if not 0 <= args.alpha <= 1:
         parser.error('alpha must be in [0, 1]')
     if not 0 < args.impquant_outlier_ratio < 1:
@@ -54,6 +92,10 @@ def parse_args(calibration=False):
         parser.error('GPTQ blocksize and percdamp must be positive')
     if args.batch_size <= 0 or (calibration and args.n_samples <= 0):
         parser.error('Batch size and sample count must be positive')
+    if calibration and args.calib_vision_micro_batch_size < 0:
+        parser.error('calib_vision_micro_batch_size must be non-negative')
+    if calibration and args.calib_input_micro_batch_size < 0:
+        parser.error('calib_input_micro_batch_size must be non-negative')
     args.gptq_groupsize = args.w_group
     args.run_process = calibration
     args.pseudo_quant = not calibration

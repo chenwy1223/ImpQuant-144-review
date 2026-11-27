@@ -3,11 +3,42 @@ import json
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 
+def _move_tensor_dict(mapping, device):
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in mapping.items()
+    }
+
+
+def _merge_generated_batches(batches, device):
+    max_length = max(inputs['inputs_embeds'].shape[1] for inputs, _ in batches)
+    merged_inputs = []
+    merged_kwargs = {}
+    for inputs, kwargs in batches:
+        embeddings = inputs['inputs_embeds']
+        pad_length = max_length - embeddings.shape[1]
+        merged_inputs.append(F.pad(embeddings, (0, 0, pad_length, 0), value=0))
+        for key, value in kwargs.items():
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f'Unsupported non-tensor calibration kwarg: {key}')
+            pad_value = -100 if key == 'labels' else 0
+            padded = F.pad(value, (pad_length, 0), value=pad_value)
+            merged_kwargs.setdefault(key, []).append(padded)
+    prompt_inputs = {'inputs_embeds': torch.cat(merged_inputs, dim=0).to(device)}
+    prompt_kwargs = {}
+    for key, values in merged_kwargs.items():
+        batch_dim = 1 if key == 'position_ids' and values[0].ndim == 3 else 0
+        prompt_kwargs[key] = torch.cat(values, dim=batch_dim).to(device)
+    return prompt_inputs, prompt_kwargs
+
+
 @torch.no_grad()
-def get_multimodal_calib_dataset(data_path, image_folder, model, n_samples=128, seed=42):
+def get_multimodal_calib_dataset(data_path, image_folder, model, n_samples=128, seed=42,
+                                 input_micro_batch_size=0):
     path = Path(data_path)
     with path.open() as stream:
         if path.suffix == '.jsonl':
@@ -33,4 +64,18 @@ def get_multimodal_calib_dataset(data_path, image_folder, model, n_samples=128, 
             with Image.open(Path(image_folder) / name) as image:
                 images.append(image.convert('RGB'))
         processed.append(model.preprocess_data(images, row))
-    return model.generate_input(model.data_collator(processed))
+    if input_micro_batch_size <= 0 or input_micro_batch_size >= len(processed):
+        return model.generate_input(model.data_collator(processed))
+
+    batches = []
+    device = next(model.model.parameters()).device
+    for start in range(0, len(processed), input_micro_batch_size):
+        chunk = processed[start:start + input_micro_batch_size]
+        prompt_inputs, prompt_kwargs = model.generate_input(model.data_collator(chunk))
+        batches.append((
+            _move_tensor_dict(prompt_inputs, 'cpu'),
+            _move_tensor_dict(prompt_kwargs, 'cpu'),
+        ))
+        del prompt_inputs, prompt_kwargs
+        torch.cuda.empty_cache()
+    return _merge_generated_batches(batches, device)

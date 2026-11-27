@@ -41,6 +41,7 @@ class Qwen2_VL(BaseModel):
 
         self.num_params = sum(p.numel() for p in self.model.parameters())
         self.device_map = getattr(model, 'hf_device_map', {})
+        self.low_memory_loss = False
 
     def fetch_vit(self):
         return self.model.vision_model
@@ -86,11 +87,29 @@ class Qwen2_VL(BaseModel):
         )
 
         hidden_states = outputs[0]
-        logits = self.model.lm_head(hidden_states)
-        logits = logits.float()
-
         loss = None
-        if labels is not None:
+        if labels is not None and self.low_memory_loss:
+            # CrossEntropyLoss(ignore_index=-100) only depends on supervised
+            # positions. Projecting every visual/prompt token to the full
+            # vocabulary needlessly allocates a large (B, N, V) tensor during
+            # MBQ gradient collection. Select the supervised hidden states
+            # first; this preserves the loss and hidden-state gradients.
+            shift_hidden = hidden_states[..., :-1, :]
+            shift_labels = labels[..., 1:].to(shift_hidden.device)
+            supervised = shift_labels != -100
+            if supervised.any():
+                supervised_hidden = shift_hidden[supervised]
+                supervised_labels = shift_labels[supervised]
+                supervised_logits = self.model.lm_head(supervised_hidden).float()
+                loss = CrossEntropyLoss()(supervised_logits, supervised_labels)
+            else:
+                loss = hidden_states.sum() * 0.0
+            logits = None
+        else:
+            logits = self.model.lm_head(hidden_states)
+            logits = logits.float()
+
+        if labels is not None and not self.low_memory_loss:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -102,6 +121,8 @@ class Qwen2_VL(BaseModel):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
+        if not return_dict and labels is not None and self.low_memory_loss:
+            return (loss,)
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -209,7 +230,33 @@ class Qwen2_VL(BaseModel):
             pixel_values = pixel_values.type(self.model.visual.get_dtype())
         else:
             pixel_values = pixel_values.to(inputs_embeds.dtype)
-        image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
+        vision_micro_batch_size = int(getattr(self, "calib_vision_micro_batch_size", 0))
+        if vision_micro_batch_size > 0 and image_grid_thw.shape[0] > vision_micro_batch_size:
+            image_embed_chunks = []
+            pixel_offset = 0
+            for grid_start in range(0, image_grid_thw.shape[0], vision_micro_batch_size):
+                grid_chunk = image_grid_thw[grid_start:grid_start + vision_micro_batch_size]
+                # Qwen2.5-VL flattens every image into prod(T,H,W) raw patches
+                # before spatial merging. Splitting on these boundaries is
+                # equivalent to the original packed visual forward while
+                # bounding its attention workspace.
+                pixel_count = int(grid_chunk.to(torch.int64).prod(dim=-1).sum().item())
+                pixel_chunk = pixel_values[pixel_offset:pixel_offset + pixel_count]
+                if pixel_chunk.shape[0] != pixel_count:
+                    raise RuntimeError(
+                        f"Vision micro-batch boundary mismatch: expected {pixel_count} "
+                        f"patches, found {pixel_chunk.shape[0]}"
+                    )
+                image_embed_chunks.append(self.model.visual(pixel_chunk, grid_thw=grid_chunk))
+                pixel_offset += pixel_count
+            if pixel_offset != pixel_values.shape[0]:
+                raise RuntimeError(
+                    f"Vision micro-batches consumed {pixel_offset} of "
+                    f"{pixel_values.shape[0]} patches"
+                )
+            image_embeds = torch.cat(image_embed_chunks, dim=0)
+        else:
+            image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
         image_mask = (input_ids == self.model.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
