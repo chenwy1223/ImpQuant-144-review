@@ -1,6 +1,6 @@
-# 8 图校准底座上的 W3A16 全局一阶 144 码
+# 256 图校准底座上的 W3A16 全局一阶 144 码
 
-在 Qwen2.5-VL-7B-Instruct 的同一份 8 张 COCO 图校准的 matched-uniform ImpQuant/GPTQ W3A16 底座上，只改动 144 个整数码。分组大小为 128，沿用原 scale、zero、输入缩放和其余模型参数。
+在 Qwen2.5-VL-7B-Instruct 的同一份 256 张 COCO 图校准的 matched-uniform ImpQuant/GPTQ W3A16 底座上，只改动 144 个整数码。分组大小为 128，沿用原 scale、zero、输入缩放和其余模型参数。
 
 | 任务 | 配对题数 | 原量化 | 改 144 码 | 差值（百分点） |
 | --- | ---: | ---: | ---: | ---: |
