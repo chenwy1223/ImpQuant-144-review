@@ -30,9 +30,9 @@ def parse_args(calibration=False):
     parser.add_argument('--impquant_probe_only', action='store_true')
     parser.add_argument('--impquant_skip_probe1', action='store_true',
                         help='Ablation: skip the visual repetition probe and use confidence=1')
-    parser.add_argument('--impquant_probe2_mode', choices=('exact', 'grouped', 'selective'),
+    parser.add_argument('--impquant_probe2_mode', choices=('exact', 'grouped', 'selective', 'uniform'),
                         default='exact',
-                        help='Probe-2 estimator: exact per patch, grouped only, or grouped with selective exact refinement')
+                        help='Probe-2 estimator or uniform visual weights with both visual probes disabled')
     parser.add_argument('--impquant_probe_group_h', type=int, default=2)
     parser.add_argument('--impquant_probe_group_w', type=int, default=2)
     parser.add_argument('--impquant_probe_refine_ratio', type=float, default=0.25)
@@ -75,7 +75,7 @@ def parse_args(calibration=False):
     if args.impquant_probe2_mode != 'exact' and args.method != 'impquant':
         parser.error('impquant_probe2_mode is valid only for ImpQuant')
     if args.impquant_probe2_mode != 'exact' and not args.impquant_skip_probe1:
-        parser.error('Grouped Probe 2 experiments require --impquant_skip_probe1')
+        parser.error('Non-exact Probe 2 modes require --impquant_skip_probe1')
     if min(args.impquant_probe_group_h, args.impquant_probe_group_w) <= 0:
         parser.error('ImpQuant probe group dimensions must be positive')
     if not 0 <= args.impquant_probe_refine_ratio <= 1:

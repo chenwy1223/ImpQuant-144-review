@@ -876,7 +876,11 @@ def _collect_global_token_importance(base_model, inputs, valid_mask_all,
     redundancy = None
     jsd = None
     baseline_stats = {}
-    if vision_mask_all is not None and vision_mask_all.any():
+    if probe2_mode == 'uniform':
+        weights[~valid_mask_all] = 0
+        if vision_mask_all is not None:
+            weights[vision_mask_all & valid_mask_all] = 1
+    elif vision_mask_all is not None and vision_mask_all.any():
         if skip_probe1:
             # JSD-only ablation. confidence = 1 makes the Probe-1 term
             # -alpha*log(confidence) exactly zero in visual_importance().
@@ -938,6 +942,8 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
                                     probe_refine_ratio=0.25,
                                     probe_refine_strategy='top_jsd',
                                     probe_refine_seed=2026):
+    if probe2_mode == 'uniform' and (not skip_probe1 or probe_only or probe_source_path or probe_cache_path):
+        raise ValueError('Uniform mode requires both visual probes disabled and no probe cache')
     base = model.model
     # InternVL's language model accepts prepared multimodal embeddings.
     probe_model = base.language_model if base.__class__.__name__ == 'InternVLChatModel' else base
@@ -1075,10 +1081,25 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
         named_linears = get_named_linears(layer)
         layer_scales = {name: torch.ones(linear.in_features) for name, linear in named_linears.items()}
         if w_bit < 16:
-            input_feat = {name: [] for name in named_linears}
-            handles = [linear.register_forward_hook(
-                lambda module, args, output, key=name: input_feat[key].append(args[0].detach().cpu()))
-                for name, linear in named_linears.items()]
+            bounded = (probe2_mode == 'uniform' and layer.__class__.__name__ == 'Qwen2_5_VLDecoderLayer'
+                       and layer.self_attn.v_proj.weight.shape != layer.self_attn.o_proj.weight.shape)
+            scale_inputs = ('self_attn.q_proj', 'mlp.gate_proj', 'mlp.down_proj') if bounded else named_linears
+            input_feat = {} if bounded else {name: [] for name in scale_inputs}
+
+            def record_scale_input(tensor, name):
+                x = tensor.detach().cpu()
+                if not bounded:
+                    input_feat[name].append(x)
+                else:
+                    if name not in input_feat:
+                        input_feat[name] = x.new_empty((total, *x.shape[1:]))
+                    target = input_feat[name][i:i + 1]
+                    assert target.shape == x.shape and target.dtype == x.dtype
+                    target.copy_(x)
+
+            handles = [named_linears[name].register_forward_hook(
+                lambda module, args, output, key=name: record_scale_input(args[0], key))
+                for name in scale_inputs]
             try:
                 for i in range(total):
                     layer(captured[i].to(device), **to_device(kwargs_list[i], device))
@@ -1088,7 +1109,7 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
             scale_groups = auto_scale_block_token_weighted(
                 layer, kwargs_list, w_bit=w_bit,
                 q_config={'zero_point': False, 'q_group_size': q_group_size},
-                input_feat={name: torch.cat(values, dim=0) for name, values in input_feat.items()},
+                input_feat=input_feat if bounded else {name: torch.cat(values, dim=0) for name, values in input_feat.items()},
                 token_weights=weights)
             for _, names, scales in scale_groups:
                 for name in names:

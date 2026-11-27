@@ -7,7 +7,7 @@ from main_quant import main
 if __name__ == "__main__":
     sys.argv[1:1] = [
         "--model", "qwen2_5_vl",
-        "--method", "gptq",
+        "--method", "impquant", "--impquant_skip_probe1", "--impquant_probe2_mode", "uniform",
         "--w_bit", "3", "--a_bit", "16", "--w_group", "128",
         "--gptq_blocksize", "128", "--gptq_percdamp", "0.1",
         "--n_samples", "256", "--seed", "42",
