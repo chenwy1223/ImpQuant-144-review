@@ -876,6 +876,7 @@ def _collect_global_token_importance(base_model, inputs, valid_mask_all,
     redundancy = None
     jsd = None
     baseline_stats = {}
+    # 有效视觉位置的原始权重设为 1，padding 置零，文本仍用上面的最后一层 attention。
     if probe2_mode == 'uniform':
         weights[~valid_mask_all] = 0
         if vision_mask_all is not None:
@@ -974,6 +975,7 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
                 setattr(layer, attr, old_module)
             config._attn_implementation = old_impl
 
+    # 视觉和文本各自按 RMS 归一化，再乘对应的模态缩放系数。
     weights, modality_scales = fixed_modality_weights(raw_weights, valid, vision, text_scale, vision_scale)
 
     if probe_cache_path is not None:
@@ -1083,6 +1085,7 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
         if w_bit < 16:
             bounded = (probe2_mode == 'uniform' and layer.__class__.__name__ == 'Qwen2_5_VLDecoderLayer'
                        and layer.self_attn.v_proj.weight.shape != layer.self_attn.o_proj.weight.shape)
+            # 在这条 Qwen2.5-VL 等权校准路径里，缩放搜索只读取这三处输入。
             scale_inputs = ('self_attn.q_proj', 'mlp.gate_proj', 'mlp.down_proj') if bounded else named_linears
             input_feat = {} if bounded else {name: [] for name in scale_inputs}
 
@@ -1091,6 +1094,7 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
                 if not bounded:
                     input_feat[name].append(x)
                 else:
+                    # 预分配 CPU 缓冲，逐样本写入，省去整批激活的额外拼接。
                     if name not in input_feat:
                         input_feat[name] = x.new_empty((total, *x.shape[1:]))
                     target = input_feat[name][i:i + 1]
@@ -1117,6 +1121,7 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
             del input_feat, scale_groups
         for name, linear in get_named_linears(layer).items():
             solver = GPTQ(linear)
+            # sym=False 使用非对称 GPTQ，由量化器确定分组 scale 和零点。
             solver.quantizer.configure(w_bit, perchannel=True, sym=False)
             sum_abs = torch.zeros(linear.in_features, device=device)
             count = 0
@@ -1127,6 +1132,7 @@ def run_impquant_weight_importance(model, prompt_inputs, prompt_kwargs, *, w_bit
                 mask = valid[sample].to(device)
                 x = x[mask]
                 p = weights[sample].to(device)[mask]
+                # 每个有效 token 的激活乘权重 p 后，再计算并累加加权 Hessian。
                 solver.H.add_(weighted_hessian(x, p))
                 sum_abs.add_(x.abs().sum(0))
                 count += x.shape[0]

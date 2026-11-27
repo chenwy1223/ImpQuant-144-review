@@ -5,6 +5,7 @@ import math
 import torch
 
 
+# 候选是这六层的 v_proj，层号使用 model.layers 的零起始索引。
 LAYERS = (7, 11, 15, 19, 23, 27)
 MODULES = tuple(f"model.layers.{layer}.self_attn.v_proj" for layer in LAYERS)
 GROUPS = ("scienceqa", "aokvqa", "textvqa", "ocr")
@@ -32,6 +33,7 @@ def select_global_144(grids, load_gradient, supervision):
     losses = [float(row["answer_nll"]) for row in supervision]
     if not all(math.isfinite(value) and value >= 0 for value in losses):
         raise ValueError("Answer losses must be finite and nonnegative")
+    # 各组以平均答案损失作归一化常数，1e-6 下限避免除零。
     norms = {
         group: float(torch.tensor(
             max(math.fsum(losses[i] for i in indices) / len(indices), 1e-6),
@@ -43,6 +45,7 @@ def select_global_144(grids, load_gradient, supervision):
     moves, projections = [], []
     for layer, module in zip(LAYERS, MODULES):
         codes, scales, zeros = _grid_tensors(grids[module], module)
+        # 原生梯度是 BF16，按组用 FP64 累加。
         sums = {group: codes.new_zeros(codes.shape, dtype=torch.float64) for group in GROUPS}
         gradients = []
         for index, row in enumerate(supervision):
@@ -52,6 +55,7 @@ def select_global_144(grids, load_gradient, supervision):
             gradients.append(gradient)
             sums[row["training_group"]].add_(gradient.to(torch.float64))
 
+        # 四组归一化梯度等权合并，用于每层的候选预筛选。
         mean = torch.stack([
             sums[group] / (EXAMPLES_PER_GROUP * norms[group]) for group in GROUPS
         ]).mean(dim=0)
@@ -61,16 +65,19 @@ def select_global_144(grids, load_gradient, supervision):
         deltas = torch.tensor(
             [move["delta_eff"] for move in block], dtype=torch.float64, device="cpu"
         )
+        # 对每道监督题取候选坐标的梯度 g，乘上相邻码真正产生的 BF16 权重变化 Δw。
         projections.append(torch.stack([g[rows, columns].to(torch.float64) * deltas for g in gradients]))
         moves.extend(block)
         del gradients
 
     # Compute the global scores from per-sample effective movements in FP64.
     projected = torch.cat(projections, dim=1)
+    # 先在组内汇总 g×Δw 并归一化，再让四组等权给出一阶损失变化。
     loss_changes = torch.stack([
         projected[indices].sum(dim=0) / (len(indices) * norms[group])
         for group, indices in group_indices.items()
     ]).mean(dim=0).tolist()
+    # 预测损失变化越小越优先。同分时按层号、行、列和方向排序。
     ranked = sorted(range(len(moves)), key=lambda i: (loss_changes[i], _move_key(moves[i])))
 
     selected, used = [], set()
@@ -79,6 +86,7 @@ def select_global_144(grids, load_gradient, supervision):
         move = moves[index]
         module = move["module"]
         coordinate = (module, move["row"], move["column"])
+        # 同一坐标只能改一次，每模块最多 96 码，六层共用 144 码预算。
         if coordinate in used or counts[module] == MODULE_CAP:
             continue
         selected.append(move)
@@ -104,6 +112,7 @@ def repair_quantized_state(state, grids, edits):
     weights = [layer.copy() for layer in state["weights"]]
     for layer, name in zip(LAYERS, MODULES):
         codes, scales, zeros = _grid_tensors(grids[name], name)
+        # 先核对原生网格解码后的 BF16 权重与缓存逐位一致。
         baseline = _decode(codes, scales, zeros)
         cached = weights[layer]["self_attn.v_proj"].detach().cpu().contiguous()
         if (cached.dtype != baseline.dtype or cached.shape != baseline.shape
@@ -115,6 +124,7 @@ def repair_quantized_state(state, grids, edits):
             continue
         if len(changes) > MODULE_CAP:
             raise ValueError(f"Per-module code budget exceeded for {name}")
+        # 对整数码副本做修改，保留原网格用于核对。
         patched_codes = codes.clone()
         for edit in changes:
             row, column = edit["row"], edit["column"]
@@ -125,8 +135,10 @@ def repair_quantized_state(state, grids, edits):
             if (old_q != edit["old_q"] or not 1 <= old_q <= 6 or direction not in (-1, 1)
                     or edit["new_q"] != old_q + direction):
                 raise ValueError(f"Expected a legal one-step code edit for {name}")
+            # 在选中的坐标写入相邻整数码 q±1。
             patched_codes[row, column] = edit["new_q"]
 
+        # 沿用原 scale 和零点，并核对实际 BF16 改变量与选码时使用的步长一致。
         patched = _decode(patched_codes, scales, zeros)
         for edit in changes:
             row, column = edit["row"], edit["column"]
@@ -153,6 +165,7 @@ def _grid_tensors(grid, module):
 
 
 def _decode(codes, scales, zeros):
+    # 每行按 128 列分组，各组用自己的 scale 和零点。FP32 解码后转回 BF16。
     grouped = codes.float().reshape(codes.shape[0], -1, GROUP_SIZE)
     value = scales.unsqueeze(-1) * (grouped - zeros.unsqueeze(-1))
     return value.reshape(codes.shape).to(torch.bfloat16)
@@ -168,11 +181,13 @@ def _shortlist(module, layer, codes, scales, zeros, mean):
     upper = (scale * (codes.float() + 1 - zero)).to(torch.bfloat16)
     down = lower.to(torch.float64) - base.to(torch.float64)
     up = upper.to(torch.float64) - base.to(torch.float64)
+    # 只保留原码为 1–6、两侧都能产生有限且非零 BF16 变化的坐标。
     legal = ((codes > 0) & (codes < 7) & torch.isfinite(base)
              & torch.isfinite(lower) & torch.isfinite(upper) & (down != 0) & (up != 0))
     if int(legal.sum()) < CANDIDATES_PER_MODULE:
         raise ValueError(f"Insufficient eligible coordinates for {module}")
 
+    # 取两个方向中更大的预测收益，按它选出每个模块的前 128 个坐标。
     best = torch.maximum(-mean * down, -mean * up).masked_fill(~legal, -math.inf)
     order = torch.argsort(best.reshape(-1), descending=True, stable=True)
     moves = []

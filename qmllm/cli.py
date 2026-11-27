@@ -30,6 +30,7 @@ def parse_args(calibration=False):
     parser.add_argument('--impquant_probe_only', action='store_true')
     parser.add_argument('--impquant_skip_probe1', action='store_true',
                         help='Ablation: skip the visual repetition probe and use confidence=1')
+    # uniform 走视觉等权路径，其他模式使用探针估计视觉权重。
     parser.add_argument('--impquant_probe2_mode', choices=('exact', 'grouped', 'selective', 'uniform'),
                         default='exact',
                         help='Probe-2 estimator or uniform visual weights with both visual probes disabled')
@@ -43,6 +44,7 @@ def parse_args(calibration=False):
     if calibration:
         parser.add_argument('--data_path', required=True)
         parser.add_argument('--image_folder', required=True)
+        # 128 是通用默认值，calibrate_w3a16.py 显式传入 256。
         parser.add_argument('--n_samples', type=int, default=128)
         parser.add_argument('--calib_vision_micro_batch_size', type=int, default=0,
                             help='Split vision-tower calibration forwards by image; 0 keeps the original full batch')
@@ -74,6 +76,7 @@ def parse_args(calibration=False):
         parser.error('impquant_skip_probe1 is valid only for ImpQuant')
     if args.impquant_probe2_mode != 'exact' and args.method != 'impquant':
         parser.error('impquant_probe2_mode is valid only for ImpQuant')
+    # uniform 等非 exact 模式要求同时关闭 Probe 1。
     if args.impquant_probe2_mode != 'exact' and not args.impquant_skip_probe1:
         parser.error('Non-exact Probe 2 modes require --impquant_skip_probe1')
     if min(args.impquant_probe_group_h, args.impquant_probe_group_w) <= 0:
